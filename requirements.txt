@@ -14,6 +14,10 @@ torchvision>=0.17.0
 # Install deep-sort-realtime WITHOUT its auto-pulled opencv-python by listing
 # opencv-python-headless above (pip resolves cv2 as already present).
 deep-sort-realtime>=1.3.2
+# lap is required by ultralytics ByteTrack at import time.
+# Ultralytics tries to auto-install it at runtime but fails on Streamlit Cloud
+# (venv is read-only after deployment). Must be declared here explicitly.
+lap>=0.5.12
 
 # ── AI Report Providers ──────────────────────────────────────────────────────
 google-generativeai>=0.7.0

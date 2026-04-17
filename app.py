@@ -796,11 +796,17 @@ def generate_pdf_bytes(
 # Core video processing
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _rgb_to_b64jpeg(rgb_array, quality: int = 75) -> str:
-    """Convert RGB numpy array to base64 JPEG string."""
+def _rgb_to_b64jpeg(rgb_array, quality: int = 70, max_width: int = 320) -> str:
+    """Convert RGB numpy array to a small base64 JPEG thumbnail.
+    Resizes to max_width before encoding to keep payloads small (~5-8 KB each).
+    """
     from PIL import Image as _PILImg
+    img = _PILImg.fromarray(rgb_array)
+    if img.width > max_width:
+        ratio = max_width / img.width
+        img = img.resize((max_width, int(img.height * ratio)), _PILImg.LANCZOS)
     buf = BytesIO()
-    _PILImg.fromarray(rgb_array).save(buf, format="JPEG", quality=quality)
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
     return base64.b64encode(buf.getvalue()).decode()
 
 
@@ -852,9 +858,11 @@ def process_video(
     frame_idx        = 0
     vcr_timeline:    list[tuple[float, float]] = []
 
-    # ── Frame store (b64 JPEG, capped at 150) ──
+    # ── Frame store (b64 JPEG thumbnails, capped at 30) ──
+    # 30 frames * ~6 KB each = ~180 KB total HTML — well within Streamlit's render limit.
+    # Frames are resized to 320px wide inside _rgb_to_b64jpeg before encoding.
     frame_store_b64: list[tuple[str, str]] = []
-    _target_frames  = 150
+    _target_frames  = 30
     _store_every    = max(1, (total_vid_frames // frame_skip) // _target_frames)
     _store_counter  = 0
 
@@ -1133,8 +1141,8 @@ def main():
         st.markdown('<span class="sidebar-label">Detection & Tracker</span>', unsafe_allow_html=True)
         conf_thresh = st.slider("Confidence threshold", 0.1, 0.95, 0.40, 0.05)
         frame_skip = st.slider(
-            "Process every N frames", 1, 15, 6,
-            help="Higher = faster. 6–8 is a good balance.",
+            "Process every N frames", 1, 15, 4,
+            help="Higher = faster. 4 processes every 4th frame for a good speed/accuracy balance.",
         )
         tracker_choice = st.selectbox(
             "Tracker",
@@ -1146,8 +1154,8 @@ def main():
         analysis_imgsz = st.select_slider(
             "Analysis resolution",
             options=[320, 416, 480, 640],
-            value=480,
-            help="Lower = faster analysis, less detail.",
+            value=320,
+            help="Lower = faster analysis, less detail. 320 is best for speed on Cloud.",
         )
 
 
@@ -1504,98 +1512,126 @@ def main():
 
         # ── Frame Gallery ──
         st.markdown("---")
-        with st.expander(f"🎞 Frame Gallery  ({len(frame_store_b64)} frames)", expanded=False):
-            view = st.radio(
-                "View", ["Normal Grid", "Compact Grid", "List"],
-                index=["Normal Grid", "Compact Grid", "List"].index(
-                    st.session_state.get("gallery_view", "Normal Grid")
-                ),
-                horizontal=True, label_visibility="collapsed", key="gallery_view",
-            )
-            # Build cell HTML once and cache it (expensive due to base64 strings).
-            # Key on video name + frame count so it rebuilds after each new analysis.
-            _frame_key = f"{video_name}_{len(frame_store_b64)}"
-            if st.session_state.get("_gallery_frame_key") != _frame_key:
-                st.session_state["_gallery_frame_key"] = _frame_key
-                st.session_state["_gallery_cells"] = [
-                    (
-                        b64,
-                        ts_label,
-                        f'data:image/jpeg;base64,{b64}',
-                    )
-                    for i, (ts_label, b64) in enumerate(frame_store_b64)
-                ]
-            _cells_data = st.session_state.get("_gallery_cells", [])
-
-            if view == "Normal Grid":
-                cols_css, thumb_h, show_ts = "repeat(4,1fr)", 160, True
-            elif view == "Compact Grid":
-                cols_css, thumb_h, show_ts = "repeat(6,1fr)", 100, False
+        _n_frames = len(frame_store_b64)
+        with st.expander(f"\U0001f39e Frame Gallery  ({_n_frames} frames)", expanded=False):
+            if not frame_store_b64:
+                st.info("No frames captured yet. Run analysis first.")
             else:
-                cols_css, thumb_h, show_ts = "repeat(1,1fr)", 200, True
+                _gcols = st.columns([3, 1, 1])
+                view = _gcols[0].radio(
+                    "View", ["Grid", "Compact", "List"],
+                    index=["Grid", "Compact", "List"].index(
+                        st.session_state.get("gallery_view", "Grid")
+                    ),
+                    horizontal=True, label_visibility="collapsed", key="gallery_view",
+                )
+                # Pagination controls
+                _PAGE_SIZE = 12
+                _total_pages = max(1, (_n_frames + _PAGE_SIZE - 1) // _PAGE_SIZE)
+                _page = st.session_state.get("gallery_page", 0)
+                _page = min(_page, _total_pages - 1)  # clamp after frame count changes
+                _page_start = _page * _PAGE_SIZE
+                _page_end   = min(_page_start + _PAGE_SIZE, _n_frames)
+                _page_frames = frame_store_b64[_page_start:_page_end]
 
-            if view == "List":
-                # Rich list view — table-style rows with CSS hover
-                list_rows = []
-                for i, (b64, ts_label, data_uri) in enumerate(_cells_data):
-                    list_rows.append(
-                        f'<div class="lrow">'
-                        f'<img src="{data_uri}" style="width:56px;height:40px;object-fit:cover;'
-                        f'border-radius:3px;border:1px solid rgba(240,165,0,0.15)"/>'
-                        f'<div>'
-                        f'<div style="font-family:\'Share Tech Mono\',monospace;color:#E8E4D9;font-size:0.78rem">'
-                        f'frame_{i+1:05d}</div>'
-                        f'<div style="font-family:\'Share Tech Mono\',monospace;color:#4E4C46;font-size:0.62rem;margin-top:2px">'
-                        f'{ts_label}</div>'
-                        f'</div>'
-                        f'<a href="{data_uri}" download="frame_{i+1:05d}.jpg" class="lrow-dl">'
-                        f'\u2193 Save</a>'
-                        f'</div>'
+                if _total_pages > 1:
+                    _pc1, _pc2, _pc3 = st.columns([1, 3, 1])
+                    if _pc1.button("\u25c4 Prev", disabled=_page == 0,
+                                   key="gal_prev", use_container_width=True):
+                        st.session_state["gallery_page"] = max(0, _page - 1)
+                        st.rerun()
+                    _pc2.markdown(
+                        f'<p style="text-align:center;font-family:\'Share Tech Mono\',monospace;'
+                        f'color:#4E4C46;font-size:0.72rem;margin:0.5rem 0">'
+                        f'Page {_page + 1} of {_total_pages} &nbsp;|&nbsp; '
+                        f'Frames {_page_start + 1}\u2013{_page_end} of {_n_frames}</p>',
+                        unsafe_allow_html=True,
                     )
-                st.markdown(
-                    '<style>'
-                    '.lrow{display:grid;grid-template-columns:56px 1fr auto;align-items:center;'
-                    'gap:12px;padding:8px 12px;border-bottom:1px solid rgba(240,165,0,0.08);'
-                    'background:rgba(17,17,16,0.6);transition:background 0.15s;}'
-                    '.lrow:hover{background:rgba(240,165,0,0.05);}'
-                    '.lrow-dl{font-family:\'Share Tech Mono\',monospace;font-size:0.65rem;'
-                    'color:#F0A500;text-decoration:none;padding:4px 10px;'
-                    'border:1px solid rgba(240,165,0,0.3);border-radius:4px;white-space:nowrap;}'
-                    '.lrow-dl:hover{background:rgba(240,165,0,0.12);}'
-                    '</style>'
-                    '<div style="border:1px solid rgba(240,165,0,0.12);border-radius:6px;overflow:hidden;margin-top:0.5rem">'
-                    '<div style="display:grid;grid-template-columns:56px 1fr auto;gap:12px;padding:6px 12px;'
-                    'background:rgba(240,165,0,0.05);border-bottom:1px solid rgba(240,165,0,0.12)">'
-                    '<span style="font-size:0.62rem;color:#4E4C46;font-family:\'Share Tech Mono\',monospace;text-transform:uppercase">Preview</span>'
-                    '<span style="font-size:0.62rem;color:#4E4C46;font-family:\'Share Tech Mono\',monospace;text-transform:uppercase">Name / Timestamp</span>'
-                    '<span style="font-size:0.62rem;color:#4E4C46;font-family:\'Share Tech Mono\',monospace;text-transform:uppercase">Download</span>'
-                    '</div>'
-                    + "".join(list_rows) + "</div>",
-                    unsafe_allow_html=True,
-                )
+                    if _pc3.button("Next \u25ba", disabled=_page >= _total_pages - 1,
+                                   key="gal_next", use_container_width=True):
+                        st.session_state["gallery_page"] = min(_total_pages - 1, _page + 1)
+                        st.rerun()
 
-            else:
-                cells = [
-                    f'<div class="gframe" style="position:relative;background:#111110;'
-                    f'border:1px solid rgba(240,165,0,0.12);overflow:hidden">'
-                    f'<img src="{data_uri}" style="width:100%;height:{thumb_h}px;object-fit:cover;display:block"/>'
-                    + (f'<div style="font-size:0.52rem;color:#4E4C46;padding:2px 4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{ts_label}</div>' if show_ts else "")
-                    + f'<a href="{data_uri}" download="frame_{i+1:05d}.jpg" class="gdl">↓ Download</a>'
-                    f'</div>'
-                    for i, (b64, ts_label, data_uri) in enumerate(_cells_data)
-                ]
-                st.markdown(
-                    '<style>'
-                    '.gframe .gdl{display:none;position:absolute;bottom:0;left:0;width:100%;'
-                    'text-align:center;background:rgba(10,10,8,0.88);color:#F0A500;'
-                    "font-family:'Share Tech Mono',monospace;font-size:0.58rem;"
-                    'text-decoration:none;padding:5px 0;}'
-                    '.gframe:hover .gdl{display:block;}'
-                    '</style>'
-                    f'<div style="display:grid;grid-template-columns:{cols_css};gap:4px;margin-top:0.5rem">'
-                    + "".join(cells) + "</div>",
-                    unsafe_allow_html=True,
-                )
+                # Build HTML for current page only (~12 frames * ~6KB = ~72KB max)
+                _drag_tip = 'title="Drag to your desktop to save, or click Download"'
+
+                if view == "List":
+                    list_rows = []
+                    for i, (ts_label, b64) in enumerate(_page_frames):
+                        data_uri = f'data:image/jpeg;base64,{b64}'
+                        abs_i = _page_start + i
+                        list_rows.append(
+                            f'<div class="lrow" draggable="true">'
+                            f'<img src="{data_uri}" style="width:56px;height:40px;object-fit:cover;'
+                            f'border-radius:3px;border:1px solid rgba(240,165,0,0.15)" {_drag_tip}/>'
+                            f'<div>'
+                            f'<div style="font-family:\'Share Tech Mono\',monospace;color:#E8E4D9;font-size:0.78rem">'
+                            f'frame_{abs_i+1:05d}</div>'
+                            f'<div style="font-family:\'Share Tech Mono\',monospace;color:#4E4C46;font-size:0.62rem;margin-top:2px">'
+                            f'{ts_label}</div>'
+                            f'</div>'
+                            f'<a href="{data_uri}" download="frame_{abs_i+1:05d}.jpg" class="lrow-dl">'
+                            f'&#8595; Save</a>'
+                            f'</div>'
+                        )
+                    st.markdown(
+                        '<style>'
+                        '.lrow{display:grid;grid-template-columns:56px 1fr auto;align-items:center;'
+                        'gap:12px;padding:8px 12px;border-bottom:1px solid rgba(240,165,0,0.08);'
+                        'background:rgba(17,17,16,0.6);transition:background 0.15s;cursor:grab;}'
+                        '.lrow:hover{background:rgba(240,165,0,0.05);}'
+                        '.lrow-dl{font-family:\'Share Tech Mono\',monospace;font-size:0.65rem;'
+                        'color:#F0A500;text-decoration:none;padding:4px 10px;'
+                        'border:1px solid rgba(240,165,0,0.3);border-radius:4px;white-space:nowrap;}'
+                        '.lrow-dl:hover{background:rgba(240,165,0,0.12);}'
+                        '</style>'
+                        '<div style="border:1px solid rgba(240,165,0,0.12);border-radius:6px;overflow:hidden;margin-top:0.5rem">'
+                        '<div style="display:grid;grid-template-columns:56px 1fr auto;gap:12px;padding:6px 12px;'
+                        'background:rgba(240,165,0,0.05);border-bottom:1px solid rgba(240,165,0,0.12)">'
+                        '<span style="font-size:0.62rem;color:#4E4C46;font-family:\'Share Tech Mono\',monospace;text-transform:uppercase">Preview</span>'
+                        '<span style="font-size:0.62rem;color:#4E4C46;font-family:\'Share Tech Mono\',monospace;text-transform:uppercase">Name / Timestamp</span>'
+                        '<span style="font-size:0.62rem;color:#4E4C46;font-family:\'Share Tech Mono\',monospace;text-transform:uppercase">Download</span>'
+                        '</div>'
+                        + "".join(list_rows) + "</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                else:
+                    # Grid / Compact Grid
+                    if view == "Grid":
+                        cols_css, thumb_h, show_ts = "repeat(4,1fr)", 160, True
+                    else:  # Compact
+                        cols_css, thumb_h, show_ts = "repeat(6,1fr)", 100, False
+
+                    cells = []
+                    for i, (ts_label, b64) in enumerate(_page_frames):
+                        data_uri = f'data:image/jpeg;base64,{b64}'
+                        abs_i = _page_start + i
+                        ts_div = (f'<div style="font-size:0.52rem;color:#4E4C46;padding:2px 4px;'
+                                   f'white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{ts_label}</div>'
+                                   if show_ts else "")
+                        cells.append(
+                            f'<div class="gframe" style="position:relative;background:#111110;'
+                            f'border:1px solid rgba(240,165,0,0.12);overflow:hidden;cursor:grab">'
+                            f'<img src="{data_uri}" draggable="true" {_drag_tip} '
+                            f'style="width:100%;height:{thumb_h}px;object-fit:cover;display:block"/>'
+                            + ts_div
+                            + f'<a href="{data_uri}" download="frame_{abs_i+1:05d}.jpg" class="gdl">&#8595; Save</a>'
+                            f'</div>'
+                        )
+                    st.markdown(
+                        '<style>'
+                        '.gframe .gdl{display:none;position:absolute;bottom:0;left:0;width:100%;'
+                        'text-align:center;background:rgba(10,10,8,0.88);color:#F0A500;'
+                        "font-family:'Share Tech Mono',monospace;font-size:0.58rem;"
+                        'text-decoration:none;padding:5px 0;}'
+                        '.gframe:hover .gdl{display:block;}'
+                        '.gframe:hover{border-color:rgba(240,165,0,0.4)!important;}'
+                        '</style>'
+                        f'<div style="display:grid;grid-template-columns:{cols_css};gap:4px;margin-top:0.5rem">'
+                        + "".join(cells) + "</div>",
+                        unsafe_allow_html=True,
+                    )
 
 
     # ── Session History ──

@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+
+# Models (large binary files — add your own)
+*.pt
+*.pth
+*.onnx
+
+# Video uploads (never commit)
+*.mp4
+*.avi
+*.mov
+*.mkv
+uploads/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Build
+dist/
+build/
+*.egg-info/

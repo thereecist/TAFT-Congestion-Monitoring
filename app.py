@@ -292,6 +292,29 @@ st.markdown(
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+def load_config() -> dict:
+    """Load persisted settings from config.json next to app.py."""
+    try:
+        import json
+        with open(_CONFIG_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_config(data: dict):
+    """Merge and persist settings to config.json."""
+    try:
+        import json
+        existing = load_config()
+        existing.update(data)
+        with open(_CONFIG_PATH, "w") as f:
+            json.dump(existing, f)
+    except Exception:
+        pass
+
+
 
 @st.cache_resource(show_spinner="Loading YOLO model…")
 def load_model(model_path: str):
@@ -303,19 +326,67 @@ def load_model(model_path: str):
         return None
 
 
-def get_gemini_model(api_key: str):
-    """Return a configured Gemini GenerativeModel, or None on import error."""
-    try:
-        import google.generativeai as genai
-        genai.configure(api_key=api_key)
-        return genai.GenerativeModel("gemini-1.5-flash")
-    except ImportError:
-        return None
+def generate_ai_report(
+    api_key: str,
+    provider: str,
+    vcr: float,
+    status_label: str,
+    vehicle_counts: dict,
+    total_pcu: float,
+    duration_sec: float,
+    timeout_sec: int = 30,
+) -> str:
+    """Generate a traffic report using Gemini, OpenAI, or Claude.
+    Runs in a thread with timeout_sec timeout to prevent hangs.
+    """
+    import concurrent.futures
 
+    def _call():
+        vc_lines = "\n".join(
+            f"  - {cls}: {int(count)} unique vehicles (PCU factor: {class_to_pcu(cls):.3f})"
+            for cls, count in sorted(vehicle_counts.items(), key=lambda x: -x[1])
+            if count > 0
+        )
+        prompt = (
+            f"You are a professional traffic engineer writing an executive summary.\n\n"
+            f"## Traffic Analysis Data\n"
+            f"- VCR: {vcr:.4f} | Status: {status_label} | Road used: {vcr*100:.1f}%\n"
+            f"- Road Capacity: {ROAD_CAPACITY_PCU} PCU/hr | Duration: {duration_sec:.1f}s\n"
+            f"- Total PCU: {total_pcu:.1f}\n"
+            f"- Vehicle breakdown:\n{vc_lines}\n\n"
+            f"PCU factors: Cars 1.0, Motorcycles 0.5, Tricycles 0.535, Buses/Trucks 3.0, Jeepneys 1.5\n\n"
+            f"Write a concise professional traffic engineering report (3 paragraphs): "
+            f"(1) situation & VCR meaning, (2) dominant vehicles & congestion contribution, "
+            f"(3) practical recommendations. Use language accessible to city planners."
+        )
+        if provider == "Gemini":
+            import google.generativeai as genai
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            return model.generate_content(prompt).text
+        elif provider == "OpenAI":
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key)
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=800,
+            )
+            return resp.choices[0].message.content
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PCU & VCR Configuration
-# ─────────────────────────────────────────────────────────────────────────────
+        elif provider == "Claude":
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+            msg = client.messages.create(
+                model="claude-3-haiku-20240307",
+                max_tokens=800,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return msg.content[0].text
+
+        else:
+            return f"⚠️ Unknown provider: {provider}"
+
 
 # PCU equivalency factors per vehicle class
 # Keys should match your YOLO model's class names (case-insensitive matching below).
@@ -331,7 +402,7 @@ PCU_FACTORS: dict[str, float] = {
     "person":       0.2,
 }
 DEFAULT_PCU = 1.0          # fallback for unlisted classes
-ROAD_CAPACITY_PCU = 1600   # PCU/hour — standard single-lane capacity
+ROAD_CAPACITY_PCU = 3000   # PCU/hour — multi-lane urban road (was 1600, adjusted for real-world observation)
 
 # BGR colors for bounding boxes (OpenCV uses BGR)
 CLASS_COLORS_BGR: dict[str, tuple] = {
@@ -378,10 +449,12 @@ def compute_vcr(total_pcu: float, fps: float, total_frames: int) -> float:
 
 def vcr_status(vcr: float) -> tuple[str, str]:
     """Return (label, badge_class) for a VCR value."""
-    if vcr < 0.5:
+    if vcr < 0.4:
         return "Free Flow", "badge-green"
-    elif vcr < 0.75:
+    elif vcr < 0.6:
         return "Stable Flow", "badge-yellow"
+    elif vcr < 0.8:
+        return "Moderate Congestion", "badge-orange"
     elif vcr < 1.0:
         return "Approaching Capacity", "badge-orange"
     else:
@@ -467,59 +540,6 @@ def make_live_pie_html(vehicle_counts: dict, vcr: float, slabel: str, sbadge: st
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AI Report
-# ─────────────────────────────────────────────────────────────────────────────
-
-def generate_ai_report(
-    api_key: str,
-    vcr: float,
-    status_label: str,
-    vehicle_counts: dict,
-    total_pcu: float,
-    duration_sec: float,
-) -> str:
-    """Call Gemini API to produce a traffic report."""
-    model = get_gemini_model(api_key)
-    if model is None:
-        return (
-            "⚠️ **google-generativeai** package not installed.\n"
-            "Run: `pip install google-generativeai` then restart."
-        )
-
-    vc_lines = "\n".join(
-        f"  - {cls}: {int(count)} detections (PCU factor: {class_to_pcu(cls):.3f})"
-        for cls, count in sorted(vehicle_counts.items(), key=lambda x: -x[1])
-        if count > 0
-    )
-
-    prompt = f"""You are a professional traffic engineer writing an executive summary.
-
-## Traffic Analysis Data
-- Volume-to-Capacity Ratio (VCR): {vcr:.4f}
-- Traffic Status: {status_label}
-- Road Capacity Used: {vcr * 100:.1f}%
-- Road Capacity Baseline: {ROAD_CAPACITY_PCU} PCU/hour
-- Video Duration Analysed: {duration_sec:.1f} seconds
-- Total Accumulated PCU: {total_pcu:.1f}
-- Vehicle Breakdown (detections):
-{vc_lines}
-
-PCU Conversion Factors Used:
-Cars: 1.0 | Motorcycles: 0.5 | Tricycles: 0.535 | Buses/Trucks: 3.0 | Jeepneys: 1.5
-
-Write a concise, professional traffic engineering report (3-4 paragraphs) that:
-1. Describes the current traffic situation and what the VCR means practically.
-2. Identifies the dominant vehicle types and their contribution to congestion.
-3. Provides practical, evidence-based recommendations for traffic management.
-4. Notes any limitations of the automated analysis.
-
-Use clear language accessible to city planners."""
-
-    try:
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as exc:
-        return f"⚠️ Gemini API error: {exc}"
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PDF Chart Helpers
@@ -1011,42 +1031,100 @@ def main():
         _pt_files = sorted(f for f in os.listdir(_app_dir) if f.endswith(".pt"))
 
         if _pt_files:
-            model_path = st.selectbox(
-                "Select model",
-                options=_pt_files,
-                index=0,
+            _mcol1, _mcol2 = st.columns([5, 1])
+            model_path = _mcol1.selectbox(
+                "Select model", options=_pt_files, index=0,
                 label_visibility="collapsed",
             )
+            # Align trash button with selectbox using CSS
+            _mcol2.markdown('<div style="margin-top:0.45rem"></div>', unsafe_allow_html=True)
+            if _mcol2.button("🗑", key="del_model", help="Delete selected model", use_container_width=True):
+                _del_path = os.path.join(_app_dir, model_path)
+                try:
+                    os.unlink(_del_path)
+                    st.success(f"Deleted {model_path}")
+                    st.rerun()
+                except Exception as _e:
+                    st.error(f"Could not delete: {_e}")
         else:
             model_path = st.text_input(
-                "YOLO model path",
-                value="exp-2.pt",
+                "YOLO model path", value="exp-2.pt",
                 label_visibility="collapsed",
                 help="No .pt files found. Place your model in the same folder as app.py.",
             )
 
         # ── Upload a new model ──
         uploaded_model = st.file_uploader(
-            "Upload a new .pt model",
-            type=["pt"],
-            help="Drop any YOLO .pt file here — it will be saved next to app.py and appear in the list above.",
+            "Upload a new .pt model", type=["pt"],
+            help="Drop any YOLO .pt file here.",
             label_visibility="visible",
         )
         if uploaded_model is not None:
             _save_path = os.path.join(_app_dir, uploaded_model.name)
             with open(_save_path, "wb") as _f:
                 _f.write(uploaded_model.getbuffer())
-            st.success(f"✅ Saved **{uploaded_model.name}** — reload the sidebar to select it.")
-            model_path = _save_path  # use it immediately this run
+            st.success(f"✅ Saved **{uploaded_model.name}**")
+            model_path = _save_path
 
-        st.markdown('<span class="sidebar-label">API Key</span>', unsafe_allow_html=True)
+        st.markdown('<span class="sidebar-label">AI Report Provider</span>', unsafe_allow_html=True)
+        ai_provider = st.selectbox(
+            "AI Provider", ["Gemini", "OpenAI", "Claude"], index=0,
+            label_visibility="collapsed",
+        )
+        _placeholders = {"Gemini": "AIza...", "OpenAI": "sk-...", "Claude": "sk-ant-..."}
+        _help_urls = {
+            "Gemini": "aistudio.google.com (free)",
+            "OpenAI": "platform.openai.com",
+            "Claude": "console.anthropic.com",
+        }
+
+        # ── Load saved key for current provider ──
+        _cfg = load_config()
+        _saved_key = _cfg.get(f"api_key_{ai_provider}", "")
+
         api_key = st.text_input(
-            "Gemini API Key",
+            f"{ai_provider} API Key",
+            value=_saved_key,
             type="password",
             label_visibility="collapsed",
-            placeholder="AIza...",
-            help="Get one free at aistudio.google.com",
+            placeholder=_placeholders[ai_provider],
+            help=f"Get your key at {_help_urls[ai_provider]}",
         )
+
+        # Save / forget key
+        _sk_col1, _sk_col2 = st.columns(2)
+        if _sk_col1.button("💾 Save Key", key="save_key", use_container_width=True,
+                           help="Save this key locally so you don't need to re-enter it",
+                           disabled=not api_key):
+            save_config({f"api_key_{ai_provider}": api_key})
+            st.success("Key saved!")
+        if _sk_col2.button("🗑 Forget Key", key="del_key", use_container_width=True,
+                           help="Remove saved key"):
+            save_config({f"api_key_{ai_provider}": ""})
+            st.rerun()
+
+        # ── API Key Status Indicator ──
+        if api_key:
+            st.markdown(
+                f'<div style="display:flex;align-items:center;gap:7px;padding:6px 10px;'
+                f'background:rgba(76,175,80,0.10);border:1px solid rgba(76,175,80,0.30);'
+                f'border-radius:6px;margin-bottom:0.4rem">'
+                f'<span style="width:8px;height:8px;border-radius:50%;background:#4caf50;'
+                f'box-shadow:0 0 6px #4caf50;flex-shrink:0"></span>'
+                f'<span style="font-family:\'Share Tech Mono\',monospace;font-size:0.68rem;'
+                f'color:#81c784">{ai_provider} key loaded{" (saved)" if _saved_key else ""} ✓</span></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div style="display:flex;align-items:center;gap:7px;padding:6px 10px;'
+                'background:rgba(244,67,54,0.08);border:1px solid rgba(244,67,54,0.25);'
+                'border-radius:6px;margin-bottom:0.4rem">'
+                '<span style="width:8px;height:8px;border-radius:50%;background:#f44336;flex-shrink:0"></span>'
+                '<span style="font-family:\'Share Tech Mono\',monospace;font-size:0.68rem;'
+                'color:#ef9a9a">No key — AI report disabled</span></div>',
+                unsafe_allow_html=True,
+            )
 
         st.markdown('<span class="sidebar-label">Detection & Tracker</span>', unsafe_allow_html=True)
         conf_thresh = st.slider("Confidence threshold", 0.1, 0.95, 0.40, 0.05)
@@ -1185,311 +1263,328 @@ def main():
                 metrics_placeholder, status_placeholder,
                 tracker=tracker_choice, imgsz=analysis_imgsz,
             )
-
         import datetime as _dt
         slabel, sbadge = vcr_status(final_vcr)
+
+        # Generate AI report immediately (while still in button block)
+        report_text = ""
+        if api_key:
+            with st.spinner(f"Generating report with {ai_provider}…"):
+                report_text = generate_ai_report(
+                    api_key, ai_provider, final_vcr, slabel,
+                    vehicle_counts, total_pcu, duration_sec
+                )
+
+        # Save everything to session_state so re-runs don't lose it
+        st.session_state["last_result"] = {
+            "vehicle_counts": vehicle_counts,
+            "total_pcu": total_pcu,
+            "fps": fps,
+            "duration_sec": duration_sec,
+            "frames_processed": frames_processed,
+            "final_vcr": final_vcr,
+            "vcr_timeline": vcr_timeline,
+            "frame_store_b64": frame_store_b64,
+            "slabel": slabel,
+            "sbadge": sbadge,
+            "report_text": report_text,
+            "video_name": uploaded.name,
+            "api_key": api_key,
+            "ai_provider": ai_provider,
+        }
+        # Also save to session history (only once per unique analysis)
+        import datetime as _dt2
+        _session_key = f"{uploaded.name}_{final_vcr:.4f}"
+        if st.session_state.get("_last_session_key") != _session_key:
+            st.session_state["_last_session_key"] = _session_key
+            st.session_state.sessions.insert(0, {
+                "id": len(st.session_state.sessions) + 1,
+                "ts": _dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "video": uploaded.name,
+                "vcr": final_vcr, "status": slabel, "badge": sbadge,
+                "total_pcu": total_pcu, "duration": duration_sec,
+                "vehicle_counts": vehicle_counts, "vcr_timeline": vcr_timeline,
+                "frame_store_b64": frame_store_b64,
+                "tracker": tracker_choice.split()[0],
+            })
+        # NO st.rerun() — session_state is readable in the same run below
+
+    # ══════════════════════════════════════════════════════
+    # RESULTS RENDERING  (reads session_state — survives any button click)
+    # ══════════════════════════════════════════════════════
+    r = st.session_state.get("last_result")
+    if r:
+        vehicle_counts  = r["vehicle_counts"]
+        total_pcu       = r["total_pcu"]
+        fps             = r["fps"]
+        duration_sec    = r["duration_sec"]
+        frames_processed= r["frames_processed"]
+        final_vcr       = r["final_vcr"]
+        vcr_timeline    = r["vcr_timeline"]
+        frame_store_b64 = r["frame_store_b64"]
+        slabel          = r["slabel"]
+        sbadge          = r["sbadge"]
+        report_text     = r["report_text"]
+        video_name      = r["video_name"]
+
         st.success(f"✅ Analysis complete — VCR: **{final_vcr:.4f}** · Status: **{slabel}**")
 
-        # ── Final Pie Chart ──
+        # Final pie chart into gauge placeholder
         gauge_placeholder.markdown(
-            f'<div class="gauge-wrapper">'
-            f'<p style="font-family:\'Share Tech Mono\',monospace;color:#4E4C46;'
-            f'font-size:0.65rem;text-transform:uppercase;letter-spacing:2px;margin-bottom:0.5rem">'
-            f'FINAL VEHICLE DISTRIBUTION · VCR</p>'
+            '<div class="gauge-wrapper">'
+            '<p style="font-family:\'Share Tech Mono\',monospace;color:#4E4C46;'
+            'font-size:0.65rem;text-transform:uppercase;letter-spacing:2px;margin-bottom:0.5rem">'
+            'FINAL VEHICLE DISTRIBUTION · VCR</p>'
             + make_live_pie_html(vehicle_counts, final_vcr, slabel, sbadge)
             + '</div>',
             unsafe_allow_html=True,
         )
 
-        # ── Summary Metrics ──
+        # Summary Metrics
         m1, m2, m3 = st.columns(3)
         m1.metric("Final VCR", f"{final_vcr:.4f}")
         m2.metric("Total PCU", f"{total_pcu:.0f}")
         m3.metric("Duration", f"{duration_sec:.1f}s")
 
-        # ── Save Session ──
-        st.session_state.sessions.insert(0, {
-            "id":            len(st.session_state.sessions) + 1,
-            "ts":            _dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "video":         uploaded.name,
-            "vcr":           final_vcr,
-            "status":        slabel,
-            "badge":         sbadge,
-            "total_pcu":     total_pcu,
-            "duration":      duration_sec,
-            "vehicle_counts": vehicle_counts,
-            "vcr_timeline":  vcr_timeline,
-            "frame_store_b64": frame_store_b64,
-            "tracker":       tracker_choice.split()[0],
-        })
-
-        # ── 🎞 Frame Gallery ──
-        if frame_store_b64:
-            st.markdown("---")
-            st.markdown(
-                '<p style="font-family:\'Russo One\',sans-serif;color:#F0A500;'
-                'letter-spacing:2px;font-size:1.1rem;text-transform:uppercase;margin-bottom:0.6rem">'
-                '🎞 Frame Gallery</p>',
-                unsafe_allow_html=True,
-            )
-            # View toggle
-            gl, gc, glist, ginfo = st.columns([1, 1, 1, 6])
-            if "gallery_view" not in st.session_state:
-                st.session_state.gallery_view = "Normal Grid"
-            if gl.button("⊞ Grid",    key="gv_norm"):   st.session_state.gallery_view = "Normal Grid"
-            if gc.button("⊟ Compact", key="gv_comp"):   st.session_state.gallery_view = "Compact Grid"
-            if glist.button("☰ List",  key="gv_list"):  st.session_state.gallery_view = "List"
-            ginfo.markdown(
-                f'<span style="font-family:\'Share Tech Mono\',monospace;color:#4E4C46;font-size:0.68rem">'
-                f'{len(frame_store_b64)} frames · view: {st.session_state.gallery_view}</span>',
-                unsafe_allow_html=True,
-            )
-
-            view = st.session_state.gallery_view
-            if view == "Normal Grid":
-                cols_per_row, thumb_h = 4, 160
-            elif view == "Compact Grid":
-                cols_per_row, thumb_h = 6, 100
+        # AI Report
+        st.markdown("#### 🤖 AI Traffic Report")
+        if not report_text:
+            if not api_key:
+                st.markdown(
+                    '<div class="report-box">⚠️ Enter your <b>API Key</b> in the sidebar to generate the AI report.</div>',
+                    unsafe_allow_html=True,
+                )
             else:
-                cols_per_row, thumb_h = 1, 260
-
-            # Build HTML gallery
-            items_html = []
-            for i, (ts_label, b64) in enumerate(frame_store_b64):
-                dl_link = (
-                    f'<a href="data:image/jpeg;base64,{b64}" download="frame_{i+1:03d}.jpg" '
-                    f'style="display:block;text-align:center;font-family:\'Share Tech Mono\',monospace;'
-                    f'font-size:0.58rem;color:#F0A500;text-decoration:none;padding:3px 0;'
-                    f'border-top:1px solid rgba(240,165,0,0.15);margin-top:4px">↓ Download</a>'
-                )
-                ts_span = (
-                    f'<div style="font-family:\'Share Tech Mono\',monospace;font-size:0.58rem;'
-                    f'color:#4E4C46;padding:3px 4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'
-                    f'{ts_label}</div>'
-                ) if view != "Compact Grid" else ""
-
-                items_html.append(
-                    f'<div style="background:#111110;border:1px solid rgba(240,165,0,0.12);overflow:hidden;">'
-                    f'<img src="data:image/jpeg;base64,{b64}" '
-                    f'style="width:100%;height:{thumb_h}px;object-fit:cover;display:block"/>'
-                    f'{ts_span}{dl_link}</div>'
-                )
-
-            # Render in rows
-            for row_start in range(0, len(items_html), cols_per_row):
-                row_cols = st.columns(cols_per_row)
-                for ci, item_html in enumerate(items_html[row_start:row_start + cols_per_row]):
-                    row_cols[ci].markdown(item_html, unsafe_allow_html=True)
-
-            st.markdown("---")
-
-
-
-        report_text = ""   # initialised here so PDF section always has access
-        # ── AI Report ──
-
-        if not api_key:
-            report_placeholder.markdown(
-                '<div class="report-box">'
-                "⚠️ Enter your <b>Gemini API Key</b> in the sidebar to generate the AI traffic report."
-                "</div>",
-                unsafe_allow_html=True,
-            )
+                # Key present but report is empty (failed or not run yet)
+                _rpt_col1, _rpt_col2 = st.columns([2, 1])
+                _rpt_col1.warning("Report generation failed or not yet run. Click to try again.")
+                if _rpt_col2.button("🔄 Generate Report", key="regen_report", use_container_width=True):
+                    _rpt_placeholder = st.empty()
+                    with _rpt_placeholder:
+                        with st.spinner(f"Generating with {r.get('ai_provider', 'Gemini')}…"):
+                            new_report = generate_ai_report(
+                                r["api_key"], r["ai_provider"], final_vcr, slabel,
+                                vehicle_counts, total_pcu, duration_sec
+                            )
+                    _rpt_placeholder.empty()
+                    st.session_state["last_result"]["report_text"] = new_report
+                    st.markdown(
+                        f'<div class="report-box">{new_report}</div>',
+                        unsafe_allow_html=True,
+                    )
         else:
-            with st.spinner("Generating AI traffic report with Gemini…"):
-                report_text = generate_ai_report(
-                    api_key, final_vcr, slabel, vehicle_counts, total_pcu, duration_sec
-                )
-            report_placeholder.markdown(
+            st.markdown(
                 f'<div class="report-box">{report_text}</div>',
                 unsafe_allow_html=True,
             )
 
-        # ════════════════════════════════════════════════════════════════
-        # INTERACTIVE CHARTS
-        # ════════════════════════════════════════════════════════════════
+        # Interactive Charts
         st.markdown("---")
         st.markdown("### 📈 Interactive Analysis Charts")
-
         chart_col1, chart_col2 = st.columns(2, gap="large")
-
-        # ── Chart 1: VCR over time (line) ──
         with chart_col1:
             if vcr_timeline:
                 times = [t for t, _ in vcr_timeline]
                 vcrs  = [v for _, v in vcr_timeline]
                 fig_vcr = go.Figure()
-                # Zone fills
                 fig_vcr.add_hrect(y0=0,    y1=0.5,  fillcolor="rgba(76,175,80,0.08)",  line_width=0)
                 fig_vcr.add_hrect(y0=0.5,  y1=0.75, fillcolor="rgba(255,193,7,0.08)",  line_width=0)
                 fig_vcr.add_hrect(y0=0.75, y1=1.0,  fillcolor="rgba(255,152,0,0.08)",  line_width=0)
                 fig_vcr.add_hrect(y0=1.0,  y1=2.0,  fillcolor="rgba(244,67,54,0.08)",  line_width=0)
-                # Capacity line
                 fig_vcr.add_hline(y=1.0, line_dash="dash", line_color="#ef5350",
                                   annotation_text="Capacity Limit", annotation_position="top right")
-                # VCR trace
                 fig_vcr.add_trace(go.Scatter(
                     x=times, y=vcrs, mode="lines",
-                    line=dict(color="#64b5f6", width=2.5, shape="spline"),
-                    fill="tozeroy", fillcolor="rgba(100,181,246,0.1)",
-                    name="VCR",
+                    line=dict(color="#F0A500", width=2.5, shape="spline"),
+                    fill="tozeroy", fillcolor="rgba(240,165,0,0.08)", name="VCR",
                     hovertemplate="Time: %{x:.1f}s<br>VCR: %{y:.3f}<extra></extra>",
                 ))
                 fig_vcr.update_layout(
-                    title=dict(text="VCR Over Time", font=dict(color="#e2e8f0", size=14, family="Plus Jakarta Sans"), x=0.01),
-                    xaxis=dict(
-                        title="Time (seconds)", color="#475569",
-                        gridcolor="rgba(255,255,255,0.04)", zeroline=False,
-                        rangeslider=dict(visible=True, thickness=0.05, bgcolor="rgba(255,255,255,0.03)"),
-                    ),
-                    yaxis=dict(
-                        title="VCR", color="#475569",
-                        gridcolor="rgba(255,255,255,0.04)", zeroline=False,
-                        range=[0, max(2.0, max(vcrs) * 1.15)],
-                    ),
-                    paper_bgcolor="rgba(15,23,42,0.6)", plot_bgcolor="rgba(15,23,42,0.4)",
-                    font=dict(color="#94a3b8", family="Plus Jakarta Sans"),
-                    legend=dict(bgcolor="rgba(0,0,0,0)"),
-                    margin=dict(l=10, r=10, t=45, b=30), height=320,
-                    hoverlabel=dict(bgcolor="#1e293b", bordercolor="rgba(255,255,255,0.1)", font_color="white"),
+                    title=dict(text="VCR Over Time", font=dict(color="#E8E4D9", size=14), x=0.01),
+                    xaxis=dict(title="Time (s)", color="#4E4C46", gridcolor="rgba(255,255,255,0.04)", zeroline=False),
+                    yaxis=dict(title="VCR", color="#4E4C46", gridcolor="rgba(255,255,255,0.04)", zeroline=False),
+                    paper_bgcolor="rgba(17,17,16,0.8)", plot_bgcolor="rgba(17,17,16,0.6)",
+                    font=dict(color="#9E9A94"), margin=dict(l=10,r=10,t=45,b=30), height=300,
                 )
                 st.plotly_chart(fig_vcr, use_container_width=True)
-
-        # ── Chart 2: Vehicle Detection Bar Chart ──
         with chart_col2:
             if vehicle_counts:
                 sorted_vc = sorted(vehicle_counts.items(), key=lambda x: -x[1])
-                classes = [c for c, _ in sorted_vc]
-                counts  = [int(n) for _, n in sorted_vc]
-                colors  = px.colors.qualitative.Vivid[:len(classes)]
                 fig_bar = go.Figure(go.Bar(
-                    x=classes, y=counts,
-                    marker=dict(color=colors, line=dict(width=0)),
-                    text=counts, textposition="outside", textfont=dict(color="#cfd8dc"),
-                    hovertemplate="%{x}: %{y} detections<extra></extra>",
+                    x=[c for c,_ in sorted_vc], y=[int(n) for _,n in sorted_vc],
+                    marker=dict(color=[f"rgb{tuple(reversed(_cls_color(c)))}" for c,_ in sorted_vc]),
+                    text=[int(n) for _,n in sorted_vc], textposition="outside",
+                    hovertemplate="%{x}: %{y}<extra></extra>",
                 ))
                 fig_bar.update_layout(
-                    title=dict(text="Vehicle Detections by Class", font=dict(color="#e2e8f0", size=14, family="Plus Jakarta Sans"), x=0.01),
-                    xaxis=dict(color="#475569", gridcolor="rgba(0,0,0,0)"),
-                    yaxis=dict(title="Detections", color="#475569", gridcolor="rgba(255,255,255,0.04)", zeroline=False),
-                    paper_bgcolor="rgba(15,23,42,0.6)", plot_bgcolor="rgba(15,23,42,0.4)",
-                    font=dict(color="#94a3b8", family="Plus Jakarta Sans"),
-                    margin=dict(l=10, r=10, t=45, b=10), height=320,
-                    bargap=0.35,
-                    hoverlabel=dict(bgcolor="#1e293b", bordercolor="rgba(255,255,255,0.1)", font_color="white"),
+                    title=dict(text="Vehicle Count by Class", font=dict(color="#E8E4D9", size=14), x=0.01),
+                    xaxis=dict(color="#4E4C46"), yaxis=dict(color="#4E4C46", gridcolor="rgba(255,255,255,0.04)"),
+                    paper_bgcolor="rgba(17,17,16,0.8)", plot_bgcolor="rgba(17,17,16,0.6)",
+                    font=dict(color="#9E9A94"), margin=dict(l=10,r=10,t=45,b=10), height=300, bargap=0.35,
                 )
                 st.plotly_chart(fig_bar, use_container_width=True)
 
         chart_col3, chart_col4 = st.columns(2, gap="large")
-
-        # ── Chart 3: PCU Contribution Donut ──
         with chart_col3:
             if vehicle_counts:
-                pcu_rows = [
-                    (cls, round(cnt * class_to_pcu(cls), 2))
-                    for cls, cnt in vehicle_counts.items() if cnt > 0
-                ]
-                pcu_rows.sort(key=lambda x: -x[1])
-                p_labels = [r[0] for r in pcu_rows]
-                p_values = [r[1] for r in pcu_rows]
+                pcu_rows = sorted(
+                    [(c, round(n * class_to_pcu(c), 2)) for c, n in vehicle_counts.items() if n > 0],
+                    key=lambda x: -x[1]
+                )
                 fig_donut = go.Figure(go.Pie(
-                    labels=p_labels, values=p_values,
-                    hole=0.55,
-                    textinfo="label+percent",
-                    hovertemplate="%{label}<br>PCU: %{value:.1f}<br>Share: %{percent}<extra></extra>",
+                    labels=[p[0] for p in pcu_rows], values=[p[1] for p in pcu_rows],
+                    hole=0.55, textinfo="label+percent",
                     marker=dict(colors=px.colors.qualitative.Pastel),
+                    hovertemplate="%{label}<br>PCU: %{value:.1f}<extra></extra>",
                 ))
                 fig_donut.update_layout(
-                    title=dict(text="PCU Contribution by Vehicle Type", font=dict(color="#e2e8f0", size=14, family="Plus Jakarta Sans"), x=0.01),
-                    paper_bgcolor="rgba(15,23,42,0.6)", plot_bgcolor="rgba(15,23,42,0.4)",
-                    font=dict(color="#94a3b8", family="Plus Jakarta Sans"),
-                    legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color="#94a3b8")),
-                    margin=dict(l=10, r=10, t=45, b=10), height=330,
-                    hoverlabel=dict(bgcolor="#1e293b", bordercolor="rgba(255,255,255,0.1)", font_color="white"),
-                    annotations=[dict(
-                        text=f"{total_pcu:.0f}<br><span style='font-size:10px'>PCU</span>",
-                        x=0.5, y=0.5, font=dict(size=18, color="white", family="Plus Jakarta Sans"),
-                        showarrow=False,
-                    )],
+                    title=dict(text="PCU Contribution", font=dict(color="#E8E4D9", size=14), x=0.01),
+                    paper_bgcolor="rgba(17,17,16,0.8)", font=dict(color="#9E9A94"),
+                    margin=dict(l=10, r=10, t=45, b=10), height=320,
+                    annotations=[dict(text=f"{total_pcu:.0f}<br>PCU", x=0.5, y=0.5,
+                                      font=dict(size=16, color="white"), showarrow=False)],
                 )
                 st.plotly_chart(fig_donut, use_container_width=True)
-
-        # ── Chart 4: VCR Zone Reference Gauge (Plotly indicator) ──
         with chart_col4:
             fig_ind = go.Figure(go.Indicator(
-                mode="gauge+number+delta",
-                value=final_vcr,
-                delta={"reference": 1.0, "valueformat": ".3f",
-                       "increasing": {"color": "#ef5350"}, "decreasing": {"color": "#66bb6a"}},
-                number={"valueformat": ".4f", "font": {"color": "white", "size": 30}},
-                gauge={
-                    "axis": {"range": [0, 2.0], "tickcolor": "#78909c",
-                             "tickfont": {"color": "#78909c"}},
-                    "bar": {"color": "#64b5f6", "thickness": 0.25},
-                    "bgcolor": "rgba(0,0,0,0)",
-                    "borderwidth": 0,
-                    "steps": [
-                        {"range": [0,    0.5],  "color": "rgba(76,175,80,0.25)"},
-                        {"range": [0.5,  0.75], "color": "rgba(255,193,7,0.25)"},
-                        {"range": [0.75, 1.0],  "color": "rgba(255,152,0,0.25)"},
-                        {"range": [1.0,  2.0],  "color": "rgba(244,67,54,0.25)"},
-                    ],
-                    "threshold": {"line": {"color": "#ef5350", "width": 3},
-                                  "thickness": 0.8, "value": 1.0},
-                },
-                title={"text": "Final VCR Gauge", "font": {"color": "#90caf9", "size": 15}},
+                mode="gauge+number+delta", value=final_vcr,
+                delta={"reference": 1.0, "increasing": {"color": "#ef5350"}, "decreasing": {"color": "#66bb6a"}},
+                number={"valueformat": ".4f", "font": {"color": "white", "size": 28}},
+                gauge={"axis": {"range": [0, 2.0]}, "bar": {"color": "#F0A500", "thickness": 0.25},
+                       "bgcolor": "rgba(0,0,0,0)", "borderwidth": 0,
+                       "steps": [{"range": [0, .5], "color": "rgba(76,175,80,0.2)"},
+                                  {"range": [.5, .75], "color": "rgba(255,193,7,0.2)"},
+                                  {"range": [.75, 1.0], "color": "rgba(255,152,0,0.2)"},
+                                  {"range": [1.0, 2.0], "color": "rgba(244,67,54,0.2)"}],
+                       "threshold": {"line": {"color": "#ef5350", "width": 3}, "thickness": 0.8, "value": 1.0}},
+                title={"text": "Final VCR", "font": {"color": "#F0A500", "size": 14}},
             ))
-            fig_ind.update_layout(
-                paper_bgcolor="rgba(15,23,42,0.6)",
-                font=dict(color="#94a3b8", family="Plus Jakarta Sans"),
-                margin=dict(l=20, r=20, t=60, b=20), height=330,
-                hoverlabel=dict(bgcolor="#1e293b", bordercolor="rgba(255,255,255,0.1)", font_color="white"),
-            )
+            fig_ind.update_layout(paper_bgcolor="rgba(17,17,16,0.8)", font=dict(color="#9E9A94"),
+                                  margin=dict(l=20, r=20, t=60, b=20), height=320)
             st.plotly_chart(fig_ind, use_container_width=True)
 
-        # ── Raw Data Expander ──
+        # Raw data
         with st.expander("📋 Raw Detection Data"):
-            rows = []
-            for cls, count in sorted(vehicle_counts.items(), key=lambda x: -x[1]):
-                pcu_f = class_to_pcu(cls)
-                rows.append({
-                    "Vehicle Class": cls,
-                    "Detections": int(count),
-                    "PCU Factor": pcu_f,
-                    "Total PCU Contribution": round(count * pcu_f, 2),
-                })
-            if rows:
-                df = pd.DataFrame(rows)
-                st.dataframe(df, use_container_width=True)
-            st.markdown(
-                f"**Video FPS:** {fps:.1f} &nbsp;|&nbsp; "
-                f"**Frames Processed:** {frames_processed} &nbsp;|&nbsp; "
-                f"**Road Capacity:** {ROAD_CAPACITY_PCU} PCU/hr"
-            )
+            raw_rows = [{"Vehicle Class": c, "Count": int(n), "PCU Factor": class_to_pcu(c),
+                         "PCU Total": round(n * class_to_pcu(c), 2)}
+                        for c, n in sorted(vehicle_counts.items(), key=lambda x: -x[1])]
+            if raw_rows:
+                st.dataframe(pd.DataFrame(raw_rows), use_container_width=True)
 
-        # ── PDF Download ──
+        # PDF Download
         st.markdown("---")
         st.markdown("### 📄 Export Report")
-        pdf_bytes = generate_pdf_bytes(
-            vcr=final_vcr,
-            status_label=slabel,
-            vehicle_counts=vehicle_counts,
-            total_pcu=total_pcu,
-            duration_sec=duration_sec,
-            fps=fps,
-            report_text=report_text,
-            video_name=uploaded.name,
-        )
-        if pdf_bytes:
-            st.download_button(
-                label="⬇️ Download PDF Report",
-                data=pdf_bytes,
-                file_name=f"traffic_report_{uploaded.name.rsplit('.',1)[0]}.pdf",
-                mime="application/pdf",
-                use_container_width=True,
+        try:
+            pdf_bytes = generate_pdf_bytes(
+                vcr=final_vcr, status_label=slabel, vehicle_counts=vehicle_counts,
+                total_pcu=total_pcu, duration_sec=duration_sec, fps=fps,
+                report_text=report_text, video_name=video_name,
             )
-        else:
-            st.warning("Install `fpdf2` to enable PDF export: `pip install fpdf2`")
+            if pdf_bytes:
+                st.download_button(
+                    label="⬇️ Download PDF Report",
+                    data=pdf_bytes,
+                    file_name=f"traffic_report_{video_name.rsplit('.', 1)[0]}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+        except Exception as _pdf_err:
+            st.warning(f"PDF generation error: {_pdf_err}")
+
+        # ── Frame Gallery ──
+        st.markdown("---")
+        with st.expander(f"🎞 Frame Gallery  ({len(frame_store_b64)} frames)", expanded=False):
+            view = st.radio(
+                "View", ["Normal Grid", "Compact Grid", "List"],
+                index=["Normal Grid", "Compact Grid", "List"].index(
+                    st.session_state.get("gallery_view", "Normal Grid")
+                ),
+                horizontal=True, label_visibility="collapsed", key="gallery_view",
+            )
+            # Build cell HTML once and cache it (expensive due to base64 strings)
+            _frame_key = id(frame_store_b64)
+            if st.session_state.get("_gallery_frame_key") != _frame_key:
+                st.session_state["_gallery_frame_key"] = _frame_key
+                st.session_state["_gallery_cells"] = [
+                    (
+                        b64,
+                        ts_label,
+                        f'data:image/jpeg;base64,{b64}',
+                    )
+                    for i, (ts_label, b64) in enumerate(frame_store_b64)
+                ]
+            _cells_data = st.session_state.get("_gallery_cells", [])
+
+            if view == "Normal Grid":
+                cols_css, thumb_h, show_ts = "repeat(4,1fr)", 160, True
+            elif view == "Compact Grid":
+                cols_css, thumb_h, show_ts = "repeat(6,1fr)", 100, False
+            else:
+                cols_css, thumb_h, show_ts = "repeat(1,1fr)", 200, True
+
+            if view == "List":
+                # Rich list view — table-style rows with CSS hover
+                list_rows = []
+                for i, (b64, ts_label, data_uri) in enumerate(_cells_data):
+                    list_rows.append(
+                        f'<div class="lrow">'
+                        f'<img src="{data_uri}" style="width:56px;height:40px;object-fit:cover;'
+                        f'border-radius:3px;border:1px solid rgba(240,165,0,0.15)"/>'
+                        f'<div>'
+                        f'<div style="font-family:\'Share Tech Mono\',monospace;color:#E8E4D9;font-size:0.78rem">'
+                        f'frame_{i+1:05d}</div>'
+                        f'<div style="font-family:\'Share Tech Mono\',monospace;color:#4E4C46;font-size:0.62rem;margin-top:2px">'
+                        f'{ts_label}</div>'
+                        f'</div>'
+                        f'<a href="{data_uri}" download="frame_{i+1:05d}.jpg" class="lrow-dl">'
+                        f'\u2193 Save</a>'
+                        f'</div>'
+                    )
+                st.markdown(
+                    '<style>'
+                    '.lrow{display:grid;grid-template-columns:56px 1fr auto;align-items:center;'
+                    'gap:12px;padding:8px 12px;border-bottom:1px solid rgba(240,165,0,0.08);'
+                    'background:rgba(17,17,16,0.6);transition:background 0.15s;}'
+                    '.lrow:hover{background:rgba(240,165,0,0.05);}'
+                    '.lrow-dl{font-family:\'Share Tech Mono\',monospace;font-size:0.65rem;'
+                    'color:#F0A500;text-decoration:none;padding:4px 10px;'
+                    'border:1px solid rgba(240,165,0,0.3);border-radius:4px;white-space:nowrap;}'
+                    '.lrow-dl:hover{background:rgba(240,165,0,0.12);}'
+                    '</style>'
+                    '<div style="border:1px solid rgba(240,165,0,0.12);border-radius:6px;overflow:hidden;margin-top:0.5rem">'
+                    '<div style="display:grid;grid-template-columns:56px 1fr auto;gap:12px;padding:6px 12px;'
+                    'background:rgba(240,165,0,0.05);border-bottom:1px solid rgba(240,165,0,0.12)">'
+                    '<span style="font-size:0.62rem;color:#4E4C46;font-family:\'Share Tech Mono\',monospace;text-transform:uppercase">Preview</span>'
+                    '<span style="font-size:0.62rem;color:#4E4C46;font-family:\'Share Tech Mono\',monospace;text-transform:uppercase">Name / Timestamp</span>'
+                    '<span style="font-size:0.62rem;color:#4E4C46;font-family:\'Share Tech Mono\',monospace;text-transform:uppercase">Download</span>'
+                    '</div>'
+                    + "".join(list_rows) + "</div>",
+                    unsafe_allow_html=True,
+                )
+
+            else:
+                cells = [
+                    f'<div class="gframe" style="position:relative;background:#111110;'
+                    f'border:1px solid rgba(240,165,0,0.12);overflow:hidden">'
+                    f'<img src="{data_uri}" style="width:100%;height:{thumb_h}px;object-fit:cover;display:block"/>'
+                    + (f'<div style="font-size:0.52rem;color:#4E4C46;padding:2px 4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{ts_label}</div>' if show_ts else "")
+                    + f'<a href="{data_uri}" download="frame_{i+1:05d}.jpg" class="gdl">↓ Download</a>'
+                    f'</div>'
+                    for i, (b64, ts_label, data_uri) in enumerate(_cells_data)
+                ]
+                st.markdown(
+                    '<style>'
+                    '.gframe .gdl{display:none;position:absolute;bottom:0;left:0;width:100%;'
+                    'text-align:center;background:rgba(10,10,8,0.88);color:#F0A500;'
+                    "font-family:'Share Tech Mono',monospace;font-size:0.58rem;"
+                    'text-decoration:none;padding:5px 0;}'
+                    '.gframe:hover .gdl{display:block;}'
+                    '</style>'
+                    f'<div style="display:grid;grid-template-columns:{cols_css};gap:4px;margin-top:0.5rem">'
+                    + "".join(cells) + "</div>",
+                    unsafe_allow_html=True,
+                )
+
 
     # ── Session History ──
     if st.session_state.get("sessions"):
@@ -1527,16 +1622,20 @@ def main():
                 # Mini frame gallery
                 if sess.get("frame_store_b64"):
                     sess_frames = sess["frame_store_b64"][::max(1, len(sess["frame_store_b64"]) // 12)][:12]
-                    hist_cols = st.columns(6)
-                    for fi, (fts, fb64) in enumerate(sess_frames):
-                        hist_cols[fi % 6].markdown(
-                            f'<div style="background:#111110;border:1px solid rgba(240,165,0,0.1)">'
-                            f'<img src="data:image/jpeg;base64,{fb64}" style="width:100%;height:80px;object-fit:cover"/>'
-                            f'<a href="data:image/jpeg;base64,{fb64}" download="s{sess["id"]}_frame_{fi+1}.jpg" '
-                            f'style="display:block;text-align:center;font-size:0.5rem;color:#F0A500;'
-                            f'font-family:\'Share Tech Mono\',monospace;padding:2px">↓</a></div>',
-                            unsafe_allow_html=True,
-                        )
+                    # Pure HTML grid — no st.columns to avoid None-button artifacts
+                    mini_cells = "".join(
+                        f'<div style="position:relative;overflow:hidden">'
+                        f'<img src="data:image/jpeg;base64,{fb64}" '
+                        f'style="width:100%;height:70px;object-fit:cover;display:block;'
+                        f'border-radius:3px;border:1px solid rgba(240,165,0,0.1)"/>'
+                        f'</div>'
+                        for fts, fb64 in sess_frames
+                    )
+                    st.markdown(
+                        f'<div style="display:grid;grid-template-columns:repeat(6,1fr);gap:4px;margin-top:0.5rem">'
+                        + mini_cells + "</div>",
+                        unsafe_allow_html=True,
+                    )
 
     # Cleanup temp file (best-effort)
     try:

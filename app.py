@@ -683,7 +683,7 @@ def generate_pdf_bytes(
         ("Volume-to-Capacity Ratio (VCR)", f"{vcr:.4f}"),
         ("Traffic Status",                 status_label),
         ("Capacity Utilised",              f"{vcr * 100:.1f}%"),
-        ("Road Capacity Baseline",         "1,600 PCU / hour"),
+        ("Road Capacity Baseline",         "3,000 PCU / hour"),
         ("Total Accumulated PCU",          f"{total_pcu:.1f}"),
         ("Duration Analysed",              f"{duration_sec:.1f} sec"),
         ("Video Frame Rate",               f"{fps:.1f} fps"),
@@ -745,35 +745,33 @@ def generate_pdf_bytes(
     pdf.ln(6)
 
     section_header("VCR INTERPRETATION GUIDE")
-    vcr_cols = [W * 0.22, W * 0.28, W * 0.50]
+    vcr_cols = [W * 0.20, W * 0.25, W * 0.55]
     vcr_hdrs = ["VCR Range", "Status", "Meaning"]
     pdf.set_font("Helvetica", "B", 7.5)
     pdf.set_fill_color(*PURPLE)
     pdf.set_text_color(*WHITE)
+    # Header row
     for i, h in enumerate(vcr_hdrs):
         pdf.cell(vcr_cols[i], 7, f"  {h}", border=1, fill=True)
     pdf.ln()
     guide = [
-        ("0.00 - 0.50", "Free Flow",           "Road is well under capacity. No action needed."),
+        ("0.00 - 0.50", "Free Flow",           "Road well under capacity. No action needed."),
         ("0.50 - 0.75", "Stable Flow",          "Normal conditions, minor delays expected."),
-        ("0.75 - 1.00", "Approaching Capacity", "Congestion building. Monitor closely."),
+        ("0.75 - 1.00", "Approaching Capacity", "Congestion building — monitor closely."),
         ("> 1.00",      "Over Capacity",        "Severely congested. Intervention required."),
     ]
     pdf.set_font("Helvetica", "", 7.5)
+    ROW_H = 7
     for idx, (rng, status, desc) in enumerate(guide):
         even = idx % 2 == 0
         pdf.set_fill_color(*ROW_A) if even else pdf.set_fill_color(*WHITE)
         pdf.set_text_color(*DARK)
-        row_y = pdf.get_y()
-        # Use multi_cell for the description (last col) to allow word wrap
-        pdf.cell(vcr_cols[0], 7, f"  {rng}",    border=1, fill=True)
-        pdf.cell(vcr_cols[1], 7, f"  {status}", border=1, fill=True)
-        # Save x position then write wrapping description
-        x_after = pdf.get_x()
-        pdf.multi_cell(vcr_cols[2], 7, f"  {desc}", border=1, fill=True)
-        # After multi_cell the cursor moves down; if it moved more than one row, we already ln'd
-        if pdf.get_y() == row_y + 7:
-            pass  # single line — already advanced
+        # All three cells on one line — use cell() only (no multi_cell which breaks alignment)
+        pdf.cell(vcr_cols[0], ROW_H, f"  {rng}",    border=1, fill=True)
+        pdf.cell(vcr_cols[1], ROW_H, f"  {status}", border=1, fill=True)
+        # Truncate description to fit in one cell row
+        desc_short = desc[:52] + "…" if len(desc) > 52 else desc
+        pdf.cell(vcr_cols[2], ROW_H, f"  {desc_short}", border=1, fill=True, ln=True)
     pdf.ln(7)
 
     # ── AI Report ──
@@ -1253,16 +1251,23 @@ def main():
 
     # ── Run Analysis ──
     if st.button("▶ Start Analysis", use_container_width=True):
-        with st.spinner(f"Running YOLO + {tracker_choice.split()[0]}…"):
-            (
-                vehicle_counts, total_pcu, fps, duration_sec,
-                frames_processed, final_vcr, vcr_timeline, frame_store_b64
-            ) = process_video(
-                tmp_path, model, conf_thresh, frame_skip,
-                video_placeholder, gauge_placeholder,
-                metrics_placeholder, status_placeholder,
-                tracker=tracker_choice, imgsz=analysis_imgsz,
-            )
+        # NOTE: No st.spinner here — the spinner context creates a blocking
+        # overlay that prevents video_placeholder from streaming frames live.
+        # Status is shown via status_placeholder inside the feed column instead.
+        status_placeholder.markdown(
+            '<p style="font-family:\'Share Tech Mono\',monospace;color:#F0A500;font-size:0.75rem">'
+            '⚙️ Analysis running…</p>',
+            unsafe_allow_html=True,
+        )
+        (
+            vehicle_counts, total_pcu, fps, duration_sec,
+            frames_processed, final_vcr, vcr_timeline, frame_store_b64
+        ) = process_video(
+            tmp_path, model, conf_thresh, frame_skip,
+            video_placeholder, gauge_placeholder,
+            metrics_placeholder, status_placeholder,
+            tracker=tracker_choice, imgsz=analysis_imgsz,
+        )
         import datetime as _dt
         slabel, sbadge = vcr_status(final_vcr)
 
@@ -1501,8 +1506,9 @@ def main():
                 ),
                 horizontal=True, label_visibility="collapsed", key="gallery_view",
             )
-            # Build cell HTML once and cache it (expensive due to base64 strings)
-            _frame_key = id(frame_store_b64)
+            # Build cell HTML once and cache it (expensive due to base64 strings).
+            # Key on video name + frame count so it rebuilds after each new analysis.
+            _frame_key = f"{video_name}_{len(frame_store_b64)}"
             if st.session_state.get("_gallery_frame_key") != _frame_key:
                 st.session_state["_gallery_frame_key"] = _frame_key
                 st.session_state["_gallery_cells"] = [

@@ -757,7 +757,7 @@ def generate_pdf_bytes(
     guide = [
         ("0.00 - 0.50", "Free Flow",           "Road well under capacity. No action needed."),
         ("0.50 - 0.75", "Stable Flow",          "Normal conditions, minor delays expected."),
-        ("0.75 - 1.00", "Approaching Capacity", "Congestion building — monitor closely."),
+        ("0.75 - 1.00", "Approaching Capacity", "Congestion building - monitor closely."),
         ("> 1.00",      "Over Capacity",        "Severely congested. Intervention required."),
     ]
     pdf.set_font("Helvetica", "", 7.5)
@@ -770,7 +770,7 @@ def generate_pdf_bytes(
         pdf.cell(vcr_cols[0], ROW_H, f"  {rng}",    border=1, fill=True)
         pdf.cell(vcr_cols[1], ROW_H, f"  {status}", border=1, fill=True)
         # Truncate description to fit in one cell row
-        desc_short = desc[:52] + "…" if len(desc) > 52 else desc
+        desc_short = desc[:52] + "..." if len(desc) > 52 else desc
         pdf.cell(vcr_cols[2], ROW_H, f"  {desc_short}", border=1, fill=True, ln=True)
     pdf.ln(7)
 
@@ -949,49 +949,55 @@ def process_video(
             ts_label = f"{frame_idx / fps:.1f}s  (frame {frame_idx})"
             frame_store_b64.append((ts_label, _rgb_to_b64jpeg(rgb, quality=72)))
 
-        # ── Live UI updates ──
-        video_placeholder.image(rgb, channels="RGB", use_container_width=True)
+        # ── Live UI updates (throttled) ──
+        # Streamlit Cloud throttles WebSocket messages: if we push every processed
+        # frame the browser only receives the last one. Throttle to every 5 frames
+        # so the live feed actually animates instead of showing a single frozen frame.
+        _UI_EVERY = 5
+        if frames_processed % _UI_EVERY == 1 or frames_processed == 1:
+            video_placeholder.image(rgb, channels="RGB", use_container_width=True)
 
-        gauge_placeholder.markdown(
-            f'<div class="gauge-wrapper">'
-            f'<p style="font-family:\'Share Tech Mono\',monospace;color:#4E4C46;'
-            f'font-size:0.65rem;text-transform:uppercase;letter-spacing:2px;margin-bottom:0.5rem">'
-            f'VEHICLE DISTRIBUTION · VCR</p>'
-            + make_live_pie_html(live_vc, live_vcr, slabel, sbadge)
-            + '</div>',
-            unsafe_allow_html=True,
-        )
+            gauge_placeholder.markdown(
+                f'<div class="gauge-wrapper">'
+                f'<p style="font-family:\'Share Tech Mono\',monospace;color:#4E4C46;'
+                f'font-size:0.65rem;text-transform:uppercase;letter-spacing:2px;margin-bottom:0.5rem">'
+                f'VEHICLE DISTRIBUTION · VCR</p>'
+                + make_live_pie_html(live_vc, live_vcr, slabel, sbadge)
+                + '</div>',
+                unsafe_allow_html=True,
+            )
 
-        top_vehicles = sorted(live_vc.items(), key=lambda x: -x[1])[:5]
-        track_label  = f"Unique Vehicles ({tracker.split()[0]})"
-        vc_html = "".join(
-            f'<div style="display:flex;justify-content:space-between;'
-            f'padding:5px 0;border-bottom:1px solid rgba(240,165,0,0.1);">'
-            f'<span style="font-family:\'Barlow Condensed\',sans-serif;color:#9E9A94;font-size:0.88rem">{cls.title()}</span>'
-            f'<span style="font-family:\'Share Tech Mono\',monospace;color:#F0A500">{int(cnt)}</span></div>'
-            for cls, cnt in top_vehicles
-        )
-        metrics_placeholder.markdown(
-            f'<div class="metric-card">'
-            f'<h4>LIVE METRICS</h4>'
-            f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:0.6rem;margin-bottom:0.8rem">'
-            f'<div><div style="font-family:\'Share Tech Mono\',monospace;color:#4E4C46;font-size:0.62rem;letter-spacing:1.5px">VCR</div>'
-            f'<div style="font-family:\'Share Tech Mono\',monospace;font-size:1.5rem;color:#F0A500">{live_vcr:.3f}</div></div>'
-            f'<div><div style="font-family:\'Share Tech Mono\',monospace;color:#4E4C46;font-size:0.62rem;letter-spacing:1.5px">PCU TOTAL</div>'
-            f'<div style="font-family:\'Share Tech Mono\',monospace;font-size:1.5rem;color:#F0A500">{cumulative_pcu:.0f}</div></div>'
-            f'</div>'
-            f'<h4 style="margin-top:0.5rem">{track_label}</h4>'
-            f"{vc_html}</div>",
-            unsafe_allow_html=True,
-        )
+            top_vehicles = sorted(live_vc.items(), key=lambda x: -x[1])[:5]
+            track_label  = f"Unique Vehicles ({tracker.split()[0]})"
+            vc_html = "".join(
+                f'<div style="display:flex;justify-content:space-between;'
+                f'padding:5px 0;border-bottom:1px solid rgba(240,165,0,0.1);">'
+                f'<span style="font-family:\'Barlow Condensed\',sans-serif;color:#9E9A94;font-size:0.88rem">{cls.title()}</span>'
+                f'<span style="font-family:\'Share Tech Mono\',monospace;color:#F0A500">{int(cnt)}</span></div>'
+                for cls, cnt in top_vehicles
+            )
+            metrics_placeholder.markdown(
+                f'<div class="metric-card">'
+                f'<h4>LIVE METRICS</h4>'
+                f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:0.6rem;margin-bottom:0.8rem">'
+                f'<div><div style="font-family:\'Share Tech Mono\',monospace;color:#4E4C46;font-size:0.62rem;letter-spacing:1.5px">VCR</div>'
+                f'<div style="font-family:\'Share Tech Mono\',monospace;font-size:1.5rem;color:#F0A500">{live_vcr:.3f}</div></div>'
+                f'<div><div style="font-family:\'Share Tech Mono\',monospace;color:#4E4C46;font-size:0.62rem;letter-spacing:1.5px">PCU TOTAL</div>'
+                f'<div style="font-family:\'Share Tech Mono\',monospace;font-size:1.5rem;color:#F0A500">{cumulative_pcu:.0f}</div></div>'
+                f'</div>'
+                f'<h4 style="margin-top:0.5rem">{track_label}</h4>'
+                f"{vc_html}</div>",
+                unsafe_allow_html=True,
+            )
 
+        # Progress bar + status always update (lightweight text only)
         progress_bar.progress(
             min(frame_idx / max(total_vid_frames, 1), 1.0),
             text=f"Frame {frame_idx}/{total_vid_frames}",
         )
         status_placeholder.markdown(
             f'<p style="font-family:\'Share Tech Mono\',monospace;color:#4E4C46;font-size:0.75rem">'
-            f'⏱ {frame_idx/fps:.1f}s / {duration_sec:.1f}s &nbsp;|&nbsp; '
+            f'&#9201; {frame_idx/fps:.1f}s / {duration_sec:.1f}s &nbsp;|&nbsp; '
             f'Frames analysed: {frames_processed}</p>',
             unsafe_allow_html=True,
         )

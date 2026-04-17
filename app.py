@@ -858,13 +858,11 @@ def process_video(
     frame_idx        = 0
     vcr_timeline:    list[tuple[float, float]] = []
 
-    # ── Frame store (b64 JPEG thumbnails, capped at 30) ──
-    # 30 frames * ~6 KB each = ~180 KB total HTML — well within Streamlit's render limit.
-    # Frames are resized to 320px wide inside _rgb_to_b64jpeg before encoding.
+    # ── Frame store: save EVERY analyzed frame as a small thumbnail ──
+    # Thumbnails are resized to 320px wide (~5 KB each) inside _rgb_to_b64jpeg,
+    # so 500 analyzed frames ≈ 2.5 MB — well within Streamlit session state limits.
+    # The gallery paginates (12/page) so the display stays fast regardless of count.
     frame_store_b64: list[tuple[str, str]] = []
-    _target_frames  = 30
-    _store_every    = max(1, (total_vid_frames // frame_skip) // _target_frames)
-    _store_counter  = 0
 
     progress_bar = st.progress(0, text="Analysing video…")
 
@@ -950,12 +948,10 @@ def process_video(
         slabel, sbadge = vcr_status(live_vcr)
         vcr_timeline.append((frame_idx / fps, live_vcr))
 
-        # ── Convert + store frame ──
+        # ── Convert + store frame (every analyzed frame) ──
         rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-        _store_counter += 1
-        if _store_counter % _store_every == 0 and len(frame_store_b64) < _target_frames:
-            ts_label = f"{frame_idx / fps:.1f}s  (frame {frame_idx})"
-            frame_store_b64.append((ts_label, _rgb_to_b64jpeg(rgb, quality=72)))
+        ts_label = f"{frame_idx / fps:.1f}s  (frame {frame_idx})"
+        frame_store_b64.append((ts_label, _rgb_to_b64jpeg(rgb, quality=70)))
 
         # ── Live UI updates (throttled) ──
         # Streamlit Cloud throttles WebSocket messages: if we push every processed
